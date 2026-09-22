@@ -57,6 +57,19 @@ From the project configuration:
 
 Android Studio (or command-line SDK + JDK 17) is recommended.
 
+## Download
+
+[Download the latest APK](https://github.com/Taibur-Rahaman/The-Right-to-Hide---TRH/releases/download/v1.0.0/KYC-Liveness-Sandbox-v1.0.0.apk)
+
+## Releases
+
+[View all releases](https://github.com/Taibur-Rahaman/The-Right-to-Hide---TRH/releases)
+
+Current release: [KYC Liveness Sandbox v1.0.0](https://github.com/Taibur-Rahaman/The-Right-to-Hide---TRH/releases/tag/v1.0.0)
+
+APK asset: `KYC-Liveness-Sandbox-v1.0.0.apk`  
+SHA-256: `dd6df25463cbb151af4810dd63db7ec4a7313b60ca43b35b228fe7806de159d7`
+
 ## Build
 
 ```bash
@@ -70,12 +83,6 @@ Debug APK output (default path):
 
 ```text
 app/build/outputs/apk/debug/app-debug.apk
-```
-
-Release asset naming used for GitHub Releases:
-
-```text
-KYC-Liveness-Sandbox-v1.0.0.apk
 ```
 
 ## Testing
@@ -103,14 +110,6 @@ gradle/       # Gradle wrapper
 ## Safety / Scope
 
 KYC Liveness Sandbox is an **internal QA simulator**. Test clips live under `app/src/main/res/raw/` when provided. Missing or corrupt clips show **Test clip unavailable** and must not crash the app. There is no camera permission, no network KYC integration, and no third-party injection.
-
-## Download
-
-Release download links are published on the GitHub Releases page for this private repository after `v1.0.0` is published.
-
-## Releases
-
-See the repository **Releases** tab for version history and APK assets.
 
 ## License / Use
 

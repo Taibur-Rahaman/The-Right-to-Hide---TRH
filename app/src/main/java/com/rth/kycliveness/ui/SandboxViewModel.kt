@@ -1,16 +1,24 @@
 package com.rth.kycliveness.ui
 
 import android.app.Application
+import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.viewModelScope
+import androidx.camera.view.PreviewView
 import androidx.media3.common.Player
-import com.rth.kycliveness.data.ClipCatalog
 import com.rth.kycliveness.data.KycTestProfile
 import com.rth.kycliveness.data.ProfileCatalog
 import com.rth.kycliveness.data.TestAction
 import com.rth.kycliveness.logging.SandboxLogger
-import com.rth.kycliveness.player.LivenessPlayer
-import com.rth.kycliveness.player.PlayerEvent
+import com.rth.kycliveness.pipeline.ActionMatcher
+import com.rth.kycliveness.pipeline.FaceSignals
+import com.rth.kycliveness.pipeline.LivenessFrameAnalyzer
+import com.rth.kycliveness.source.CameraDeviceInfo
+import com.rth.kycliveness.source.InputSourceController
+import com.rth.kycliveness.source.InputSourceType
+import com.rth.kycliveness.source.SourceEvent
+import com.rth.kycliveness.source.TestMediaInfo
 import com.rth.kycliveness.state.KycTestStateMachine
 import com.rth.kycliveness.state.TestPhase
 import com.rth.kycliveness.state.TestResult
@@ -25,15 +33,26 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 data class SandboxUiState(
+    val developerMode: Boolean = false,
+    val inputSource: InputSourceType = InputSourceType.LIVE_CAMERA,
     val selectedProfile: KycTestProfile = ProfileCatalog.defaultProfile(),
     val showMoreProfiles: Boolean = false,
     val showMoreActions: Boolean = false,
     val snapshot: TestSnapshot = TestSnapshot(),
     val requiredAction: TestAction? = null,
-    val clipUnavailable: Boolean = false,
-    val videoMessage: String? = null,
-    val isPlaying: Boolean = false,
     val testStarted: Boolean = false,
+    val faceDetected: Boolean = false,
+    val sourceStatus: String? = null,
+    val sourceError: String? = null,
+    val cameraPermissionGranted: Boolean = false,
+    val availableCameras: List<CameraDeviceInfo> = emptyList(),
+    val activeCameraLabel: String? = null,
+    val testMediaName: String? = null,
+    val testMediaUri: Uri? = null,
+    val isPlaying: Boolean = false,
+    val playbackPositionMs: Long = 0L,
+    val playbackDurationMs: Long = 0L,
+    val verificationLabel: String = "Idle",
 )
 
 class SandboxViewModel(
@@ -41,42 +60,158 @@ class SandboxViewModel(
 ) : AndroidViewModel(application) {
 
     private val stateMachine = KycTestStateMachine()
+    private val actionMatcher = ActionMatcher()
     private var timeoutJob: Job? = null
     private var tickerJob: Job? = null
 
     private val _uiState = MutableStateFlow(SandboxUiState())
     val uiState: StateFlow<SandboxUiState> = _uiState.asStateFlow()
 
-    private var player: LivenessPlayer? = null
+    private val frameAnalyzer = LivenessFrameAnalyzer(
+        onSignals = { signals -> onFaceSignals(signals) },
+        onError = { msg ->
+            _uiState.update { it.copy(sourceError = msg) }
+        },
+    )
 
-    val exoPlayer: Player?
-        get() = player?.player
-
-    fun attachPlayer() {
-        if (player != null) return
-        player = LivenessPlayer(getApplication()) { event ->
-            when (event) {
-                is PlayerEvent.Completed -> onVideoCompleted(event.action)
-                is PlayerEvent.Error -> onVideoError(event)
-                is PlayerEvent.StateChanged -> _uiState.update { it.copy(isPlaying = event.isPlaying) }
+    private val sources = InputSourceController(application) { event ->
+        when (event) {
+            is SourceEvent.Frame -> frameAnalyzer.analyze(event.bitmap, event.timestampMs)
+            is SourceEvent.Error -> _uiState.update {
+                it.copy(sourceError = event.message, sourceStatus = event.message)
+            }
+            is SourceEvent.Status -> _uiState.update {
+                it.copy(sourceStatus = event.message, sourceError = null)
+            }
+            is SourceEvent.Playback -> _uiState.update {
+                it.copy(
+                    isPlaying = event.isPlaying,
+                    playbackPositionMs = event.positionMs,
+                    playbackDurationMs = event.durationMs,
+                )
             }
         }
     }
 
-    fun selectProfile(profile: KycTestProfile) {
-        if (_uiState.value.snapshot.phase != TestPhase.IDLE &&
-            _uiState.value.snapshot.result == TestResult.NONE &&
-            _uiState.value.testStarted
-        ) {
-            // Allow profile change only when idle or finished; reset first for clarity.
-            reset()
+    val exoPlayer: Player?
+        get() = sources.exoPlayer()
+
+    init {
+        sources.select(InputSourceType.LIVE_CAMERA)
+    }
+
+    fun setDeveloperMode(enabled: Boolean) {
+        _uiState.update { it.copy(developerMode = enabled) }
+        if (!enabled && _uiState.value.inputSource != InputSourceType.LIVE_CAMERA) {
+            selectInputSource(InputSourceType.LIVE_CAMERA)
         }
+    }
+
+    fun selectInputSource(type: InputSourceType) {
+        if (!_uiState.value.developerMode && type != InputSourceType.LIVE_CAMERA) {
+            return
+        }
+        sources.stopActive()
+        sources.select(type)
+        actionMatcher.reset()
         _uiState.update {
             it.copy(
-                selectedProfile = profile,
-                showMoreProfiles = false,
+                inputSource = type,
+                sourceError = null,
+                sourceStatus = when (type) {
+                    InputSourceType.LIVE_CAMERA -> "Live Camera"
+                    InputSourceType.TEST_VIDEO -> "TEST SOURCE: Video"
+                    InputSourceType.TEST_IMAGE -> "TEST SOURCE: Image"
+                },
+                testMediaName = sources.testMedia()?.currentMedia()?.displayName,
+                testMediaUri = sources.testMedia()?.currentMedia()?.uri,
+                isPlaying = false,
             )
         }
+        if (type == InputSourceType.LIVE_CAMERA && _uiState.value.cameraPermissionGranted) {
+            sources.startActive()
+            refreshCameras()
+        } else if (type != InputSourceType.LIVE_CAMERA) {
+            sources.startActive()
+        }
+    }
+
+    fun onCameraPermissionResult(granted: Boolean) {
+        _uiState.update { it.copy(cameraPermissionGranted = granted) }
+        if (granted && _uiState.value.inputSource == InputSourceType.LIVE_CAMERA) {
+            sources.startActive()
+            refreshCameras()
+        } else if (!granted) {
+            _uiState.update {
+                it.copy(sourceError = "Camera permission denied")
+            }
+        }
+    }
+
+    fun bindCameraPreview(owner: LifecycleOwner, previewView: PreviewView) {
+        sources.bindLivePreview(owner, previewView)
+        if (_uiState.value.cameraPermissionGranted &&
+            _uiState.value.inputSource == InputSourceType.LIVE_CAMERA
+        ) {
+            sources.startActive()
+            refreshCameras()
+        }
+    }
+
+    fun switchCamera() {
+        if (_uiState.value.inputSource != InputSourceType.LIVE_CAMERA) return
+        val active = sources.liveCamera()?.switchCamera()
+        _uiState.update { it.copy(activeCameraLabel = active?.label) }
+        refreshCameras()
+    }
+
+    fun setTestMedia(uri: Uri, displayName: String, mimeType: String?, sizeBytes: Long) {
+        if (!_uiState.value.developerMode) return
+        val type = _uiState.value.inputSource
+        if (type != InputSourceType.TEST_VIDEO && type != InputSourceType.TEST_IMAGE) return
+        val info = TestMediaInfo(
+            uri = uri,
+            displayName = displayName,
+            mimeType = mimeType,
+            sizeBytes = sizeBytes,
+        )
+        sources.select(type)
+        sources.testMedia()?.setMedia(info)
+        sources.startActive()
+        _uiState.update {
+            it.copy(
+                testMediaName = displayName,
+                testMediaUri = uri,
+                sourceError = null,
+            )
+        }
+    }
+
+    fun clearTestMedia() {
+        sources.testMedia()?.clearMedia()
+        _uiState.update {
+            it.copy(
+                testMediaName = null,
+                testMediaUri = null,
+                isPlaying = false,
+                playbackPositionMs = 0L,
+                playbackDurationMs = 0L,
+            )
+        }
+    }
+
+    fun playTestMedia() = sources.testMedia()?.play()
+    fun pauseTestMedia() = sources.testMedia()?.pause()
+    fun restartTestMedia() = sources.testMedia()?.restart()
+
+    fun selectProfile(profile: KycTestProfile) {
+        if (_uiState.value.testStarted &&
+            _uiState.value.snapshot.result == TestResult.NONE &&
+            _uiState.value.snapshot.phase != TestPhase.IDLE
+        ) {
+            reset()
+        }
+        _uiState.update { it.copy(selectedProfile = profile, showMoreProfiles = false) }
     }
 
     fun toggleMoreProfiles(show: Boolean) {
@@ -88,147 +223,165 @@ class SandboxViewModel(
     }
 
     fun startTest() {
-        attachPlayer()
-        player?.stop()
+        if (_uiState.value.inputSource == InputSourceType.TEST_IMAGE) {
+            _uiState.update {
+                it.copy(sourceError = "Static image cannot be used for this liveness test.")
+            }
+            return
+        }
+        if (_uiState.value.inputSource == InputSourceType.TEST_VIDEO &&
+            _uiState.value.testMediaUri == null
+        ) {
+            _uiState.update { it.copy(sourceError = "No test video selected") }
+            return
+        }
+        if (_uiState.value.inputSource == InputSourceType.LIVE_CAMERA &&
+            !_uiState.value.cameraPermissionGranted
+        ) {
+            _uiState.update { it.copy(sourceError = "Camera permission required") }
+            return
+        }
+
+        actionMatcher.reset()
+        sources.startActive()
+        if (_uiState.value.inputSource == InputSourceType.TEST_VIDEO) {
+            sources.testMedia()?.restart()
+        }
+
         val profile = _uiState.value.selectedProfile
         val snap = stateMachine.start(profile)
         SandboxLogger.testStarted(profile.id)
-        publish(snap, clipUnavailable = false, videoMessage = null)
-        _uiState.update { it.copy(testStarted = true) }
+        // Enter ACTION_PLAYING for the first required action so pipeline can complete it.
+        val required = stateMachine.requiredAction()
+        val playing = if (required != null) {
+            stateMachine.beginAction(required)
+        } else {
+            snap
+        }
+        publish(playing)
+        _uiState.update {
+            it.copy(
+                testStarted = true,
+                verificationLabel = "Processing",
+                sourceError = null,
+            )
+        }
         startTicker()
+        startActionTimeout()
     }
 
-    fun onActionSelected(action: TestAction) {
-        val before = stateMachine.snapshot()
-        if (before.phase != TestPhase.WAITING_FOR_ACTION &&
-            before.phase != TestPhase.RETRY
+    /**
+     * Developer-only manual action inject for exercising the state machine.
+     * Does not auto-pass merely by selecting a file.
+     */
+    fun onManualAction(action: TestAction) {
+        if (!_uiState.value.developerMode) return
+        val phase = stateMachine.snapshot().phase
+        if (phase != TestPhase.WAITING_FOR_ACTION &&
+            phase != TestPhase.RETRY &&
+            phase != TestPhase.ACTION_PLAYING
         ) {
             return
         }
-        val snap = stateMachine.beginAction(action)
-        if (snap.phase == TestPhase.ACTION_PLAYING) {
-            SandboxLogger.actionStarted(action.displayLabel())
-            publish(snap)
-            playRequiredClip()
-            startActionTimeout()
-        } else {
-            if (snap.phase == TestPhase.WAITING_FOR_ACTION || snap.phase == TestPhase.RETRY) {
-                SandboxLogger.retry(
-                    stateMachine.requiredAction()?.displayLabel().orEmpty(),
-                    snap.retriesUsed,
-                )
+        val required = stateMachine.requiredAction() ?: return
+        if (phase == TestPhase.WAITING_FOR_ACTION || phase == TestPhase.RETRY) {
+            val snap = stateMachine.beginAction(action)
+            if (snap.phase != TestPhase.ACTION_PLAYING) {
+                publish(snap)
+                if (snap.result == TestResult.FAILED) {
+                    _uiState.update { it.copy(verificationLabel = "Failure") }
+                }
+                return
             }
-            if (snap.result == TestResult.FAILED) {
-                SandboxLogger.actionFailed(action.displayLabel(), snap.lastError.orEmpty())
-                SandboxLogger.testFailed()
-                stopTimeout()
-            } else {
-                SandboxLogger.actionFailed(
-                    stateMachine.requiredAction()?.displayLabel().orEmpty(),
-                    snap.lastError.orEmpty(),
-                )
-            }
+        } else if (action != required) {
+            val snap = stateMachine.onActionFailed("Wrong action selected")
             publish(snap)
+            return
         }
+        completeCurrentAction()
     }
-
-    fun play() = player?.play()
-    fun pause() = player?.pause()
-    fun replay() = player?.replay()
-    fun stopVideo() = player?.stop()
 
     fun reset() {
         stopTimeout()
         stopTicker()
-        player?.stop()
+        actionMatcher.reset()
+        sources.testMedia()?.pause()
         val snap = stateMachine.reset()
         SandboxLogger.reset()
         _uiState.update {
-            SandboxUiState(
-                selectedProfile = it.selectedProfile,
+            it.copy(
                 snapshot = snap,
                 requiredAction = null,
-                clipUnavailable = false,
-                videoMessage = null,
-                isPlaying = false,
                 testStarted = false,
+                faceDetected = false,
+                verificationLabel = "Idle",
+                sourceError = null,
             )
         }
     }
 
-    private fun playRequiredClip() {
-        val action = stateMachine.requiredAction() ?: return
-        val resolution = ClipCatalog.resolve(getApplication(), action)
-        if (!resolution.isAvailable) {
-            SandboxLogger.videoError("Missing clip ${resolution.clipName}.mp4")
-            _uiState.update {
-                it.copy(
-                    clipUnavailable = true,
-                    videoMessage = "Test clip unavailable",
-                )
-            }
-            // Placeholder handling: no binary clips ship with the sandbox.
-            // Surface the message, do not crash, and complete the simulated action.
-            viewModelScope.launch {
-                delay(350)
-                if (stateMachine.snapshot().phase == TestPhase.ACTION_PLAYING) {
-                    stopTimeout()
-                    SandboxLogger.actionCompleted(action.displayLabel())
-                    val snap = stateMachine.onActionCompleted()
-                    if (snap.result == TestResult.PASSED) SandboxLogger.testPassed()
-                    publish(snap, clipUnavailable = true, videoMessage = "Test clip unavailable")
-                }
-            }
+    private fun onFaceSignals(signals: FaceSignals) {
+        _uiState.update { it.copy(faceDetected = signals.faceDetected) }
+        val snap = stateMachine.snapshot()
+        if (snap.phase != TestPhase.ACTION_PLAYING &&
+            snap.phase != TestPhase.WAITING_FOR_ACTION &&
+            snap.phase != TestPhase.RETRY
+        ) {
             return
         }
-        _uiState.update {
-            it.copy(clipUnavailable = false, videoMessage = null)
+        // Image source must never succeed via face hold alone for motion actions
+        if (_uiState.value.inputSource == InputSourceType.TEST_IMAGE) {
+            return
         }
-        player?.playClip(resolution)
+        val required = stateMachine.requiredAction() ?: return
+        // Ensure we are in ACTION_PLAYING for the required action
+        if (snap.phase == TestPhase.WAITING_FOR_ACTION || snap.phase == TestPhase.RETRY) {
+            stateMachine.beginAction(required)
+            publish(stateMachine.snapshot())
+        }
+        val matched = actionMatcher.evaluate(required, signals) ?: return
+        if (matched == required) {
+            completeCurrentAction()
+        }
     }
 
-    private fun onVideoCompleted(action: TestAction) {
-        val required = stateMachine.requiredAction()
-        if (required != action) return
+    private fun completeCurrentAction() {
+        val action = stateMachine.requiredAction() ?: return
         if (stateMachine.snapshot().phase != TestPhase.ACTION_PLAYING) return
         stopTimeout()
         SandboxLogger.actionCompleted(action.displayLabel())
         val snap = stateMachine.onActionCompleted()
         when (snap.result) {
-            TestResult.PASSED -> SandboxLogger.testPassed()
-            TestResult.FAILED -> SandboxLogger.testFailed()
-            TestResult.NONE -> Unit
+            TestResult.PASSED -> {
+                SandboxLogger.testPassed()
+                _uiState.update { it.copy(verificationLabel = "Success") }
+                sources.testMedia()?.pause()
+            }
+            TestResult.FAILED -> {
+                SandboxLogger.testFailed()
+                _uiState.update { it.copy(verificationLabel = "Failure") }
+            }
+            TestResult.NONE -> {
+                _uiState.update { it.copy(verificationLabel = "Processing") }
+                // Advance to next required action
+                val next = stateMachine.requiredAction()
+                if (next != null && snap.phase == TestPhase.WAITING_FOR_ACTION) {
+                    publish(stateMachine.beginAction(next))
+                    startActionTimeout()
+                } else {
+                    publish(snap)
+                }
+                return
+            }
         }
         publish(snap)
     }
 
-    private fun onVideoError(event: PlayerEvent.Error) {
-        SandboxLogger.videoError(event.message)
+    private fun refreshCameras() {
+        val cams = sources.liveCamera()?.listCameras().orEmpty()
+        val active = sources.liveCamera()?.activeCamera()?.label
         _uiState.update {
-            it.copy(
-                clipUnavailable = event.missing,
-                videoMessage = if (event.missing) "Test clip unavailable" else event.message,
-            )
-        }
-        handlePlaybackFailure(event.message)
-    }
-
-    private fun handlePlaybackFailure(reason: String) {
-        if (stateMachine.snapshot().phase != TestPhase.ACTION_PLAYING) return
-        val actionLabel = stateMachine.requiredAction()?.displayLabel().orEmpty()
-        SandboxLogger.actionFailed(actionLabel, reason)
-        val snap = stateMachine.onActionFailed(reason)
-        if (snap.phase == TestPhase.ACTION_PLAYING) {
-            SandboxLogger.retry(actionLabel, snap.retriesUsed)
-            publish(snap)
-            playRequiredClip()
-            startActionTimeout()
-        } else if (snap.result == TestResult.FAILED) {
-            SandboxLogger.testFailed()
-            stopTimeout()
-            publish(snap)
-        } else {
-            publish(snap)
+            it.copy(availableCameras = cams, activeCameraLabel = active)
         }
     }
 
@@ -238,7 +391,27 @@ class SandboxViewModel(
         timeoutJob = viewModelScope.launch {
             delay(timeoutMs)
             if (stateMachine.snapshot().phase == TestPhase.ACTION_PLAYING) {
-                handlePlaybackFailure("Action timed out")
+                val label = stateMachine.requiredAction()?.displayLabel().orEmpty()
+                SandboxLogger.actionFailed(label, "Action timed out")
+                val snap = stateMachine.onActionFailed("Action timed out")
+                if (snap.phase == TestPhase.ACTION_PLAYING ||
+                    snap.phase == TestPhase.WAITING_FOR_ACTION
+                ) {
+                    SandboxLogger.retry(label, snap.retriesUsed)
+                    val required = stateMachine.requiredAction()
+                    if (required != null && snap.phase == TestPhase.WAITING_FOR_ACTION) {
+                        publish(stateMachine.beginAction(required))
+                    } else {
+                        publish(snap)
+                    }
+                    startActionTimeout()
+                } else if (snap.result == TestResult.FAILED) {
+                    SandboxLogger.testFailed()
+                    _uiState.update { it.copy(verificationLabel = "Failure") }
+                    publish(snap)
+                } else {
+                    publish(snap)
+                }
             }
         }
     }
@@ -254,14 +427,13 @@ class SandboxViewModel(
             while (isActive) {
                 delay(250)
                 val snap = stateMachine.tickElapsed()
+                publish(snap)
                 if (snap.phase == TestPhase.IDLE ||
                     snap.phase == TestPhase.PASSED ||
                     snap.phase == TestPhase.FAILED
                 ) {
-                    publish(snap)
                     break
                 }
-                publish(snap)
             }
         }
     }
@@ -271,17 +443,11 @@ class SandboxViewModel(
         tickerJob = null
     }
 
-    private fun publish(
-        snap: TestSnapshot,
-        clipUnavailable: Boolean = _uiState.value.clipUnavailable,
-        videoMessage: String? = _uiState.value.videoMessage,
-    ) {
+    private fun publish(snap: TestSnapshot) {
         _uiState.update {
             it.copy(
                 snapshot = snap,
                 requiredAction = stateMachine.requiredAction(),
-                clipUnavailable = clipUnavailable,
-                videoMessage = videoMessage,
                 testStarted = snap.phase != TestPhase.IDLE,
             )
         }
@@ -290,8 +456,8 @@ class SandboxViewModel(
     override fun onCleared() {
         stopTimeout()
         stopTicker()
-        player?.release()
-        player = null
+        frameAnalyzer.close()
+        sources.releaseAll()
         super.onCleared()
     }
 }
